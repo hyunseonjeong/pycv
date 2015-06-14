@@ -1,0 +1,147 @@
+""" Computer Vision homework - Panorama Stitching
+
+    Chapter3. Feature-based alignment
+        3.3 Implement a panorama stitching using multiple images.
+
+    # 1. Read images from directory
+    # 2. Get descriptors using ORB(Oriented FAST and rotated BRIEF)
+    # 3. Match descriptors and get features
+    # 4. Estimate models and homography using RANSAC(RANdom SAmple Conesensus)
+    # 5. Warp images and merge
+
+    Author: Hyunseon Jeong
+    Lab   : Computer Vision Lab.
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage import io
+from skimage import transform
+from skimage.color import rgb2gray, gray2rgb
+from skimage.feature import ORB, match_descriptors, plot_matches
+from skimage.measure import ransac
+from skimage.transform import warp, ProjectiveTransform, SimilarityTransform
+
+def read_images(number_of_images, path):
+    img_set = [] # image name required: %d.jpg
+    for i in range(1,number_of_images+1):
+        img_name = path+'/%d.jpg' % i
+        img = io.imread(img_name)
+        img = rgb2gray(img)
+        img_set.append(img)
+        print "read images...%d" % i
+    return img_set
+
+def resize_images(image_set, scale):
+#    print "image size", image_set[0].shape
+    for i in range(len(image_set)):
+        image_set[i] = transform.rescale(image_set[i], scale)
+    print "image rescaling x",scale
+#    print "image size", image_set[0].shape
+    return image_set
+
+def get_descriptors(image, num_keypoints, threshold):
+    orb = ORB(n_keypoints=num_keypoints, fast_threshold=threshold)
+    orb.detect_and_extract(image)
+    keys = orb.keypoints
+    desc = orb.descriptors
+    return keys, desc
+
+def feature_match(desc1, desc2):
+    print "find matches from descriptors"
+    matches = match_descriptors(desc1, desc2, cross_check=True)
+    return matches
+
+def find_homography(key1, key2, matches):
+    src = key1[matches[:, 1]][:, ::-1]
+    dst = key2[matches[:, 0]][:, ::-1]
+    feature_set = (src, dst)
+    model, inlier = ransac(feature_set, ProjectiveTransform, min_samples=4, residual_threshold=2)
+    hom = model.params
+    def normalize(points):
+        for row in points:
+            row /= points[-1]
+        return points
+    # print 'find homography'
+    # print hom
+    # print 'normalized homography'
+    # print normalize(hom)
+#    print 'number of inliers: %d' %len(inlier)
+    return model #hom, inlier
+
+def get_image_corners(image, model):
+    def get_corners(image):
+        corners = np.array([[0, 0],
+                            [0, len(image)],
+                            [len(image[0]), 0],
+                            [len(image[0]), len(image)]])
+        return corners
+    con = get_corners(image)
+    warped_corners = model(con)
+    all_con = np.vstack((warped_corners, con))
+#    print "all corners: "
+#    print all_con
+    con_min = np.min(all_con, axis=0)
+    con_max = np.max(all_con, axis=0)
+    out_corner = (con_max - con_min)
+    out_corner = np.ceil(out_corner[::-1])
+    print 'out_corner', out_corner
+#    print 'corner_min, corner_max', con_min, con_max
+    return out_corner, con_min
+
+def get_image_palette(image, corner1, corner2):
+    r, c = image.shape[:2]
+#    print r, c
+    total_rows = corner1[0] + corner2[0] - r # max_rows
+    total_cols = corner1[1] + corner2[1] - c # max_cols
+    palette = (total_rows, total_cols)
+    print 'entire size of image:', palette
+    return palette
+
+def blend_images(image1, image2):
+    def add_alpha(image):
+        rgb = gray2rgb(image)
+        alpha =((rgb[:,:,0]*rgb[:,:,1]*rgb[:,:,2])>0)
+        return np.dstack((rgb, alpha))
+    image1 = add_alpha(image1)
+    image2 = add_alpha(image2)
+    merged = image1 + image2
+    alpha = merged[..., 3]
+    merged /= np.maximum(alpha, 1)[..., np.newaxis]
+    return merged
+
+# Test Panorama Stitching
+directory_name = './src'   # write image directory here
+images = read_images(3, directory_name)    # read images
+#images = resize_images(images, 0.5)        # resize images
+img1 = images[0]
+img2 = images[1]
+img3 = images[2]
+img1_key, img1_desc = get_descriptors(img1, 3000, 0.05)  # get descriptors from images
+img2_key, img2_desc = get_descriptors(img2, 3000, 0.05)
+img3_key, img3_desc = get_descriptors(img3, 3000, 0.05)
+
+feature1 = feature_match(img2_desc, img1_desc)  # get matching features
+feature2 = feature_match(img2_desc, img3_desc)
+model1 = find_homography(img1_key, img2_key, feature1)  # get robust model
+model2 = find_homography(img3_key, img2_key, feature2)
+
+corner1, con_min1 = get_image_corners(img2, model1)  # get image corners
+corner2, con_min2 = get_image_corners(img3, model2)
+out_shape = get_image_palette(img2, corner1, corner2)  # get entire size of image
+
+print "image warping..."  # warping images
+offset = SimilarityTransform(translation=-(con_min1))
+img1 = warp(img1, (model1 + offset).inverse, output_shape=out_shape, cval=-1)  # image1
+img2 = warp(img2, offset.inverse, output_shape=out_shape, cval=-1)  # image2
+
+offset = SimilarityTransform(translation=-(con_min2 + con_min1))
+offset_trans = SimilarityTransform(translation=[0,con_min2[1]])  # translate to image2 coordinate
+img3 = warp(img3, (model2 + offset + offset_trans).inverse, output_shape=out_shape, cval=-1)  # image3
+
+print "image blending..."  # merging images
+merged = blend_images(img1,img2) + blend_images(img3,img2) - blend_images(img2,img2)
+plt.figure()
+io.imshow(merged)
+plt.axis('off')
+io.show()
